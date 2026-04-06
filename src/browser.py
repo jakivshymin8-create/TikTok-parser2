@@ -21,35 +21,50 @@ TIKTOK_URL = "https://www.tiktok.com/"
 _PROFILE_DIR = Path(__file__).resolve().parent.parent / ".tiktok_chrome_profile"
 
 # ── JS: глобальный мут — IIFE, чтобы add_init_script реально выполнял код ─────
+# КРИТИЧНО: звук НИКОГДА не должен включаться
 _MUTE_INIT_SCRIPT = """
 (function() {
+    // Перехватываем play() — всегда muted
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function() {
         this.muted = true;
         this.volume = 0;
         return origPlay.apply(this, arguments);
     };
+    
+    // Блокируем изменение volume — всегда 0
     const origVolDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'volume');
     Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
         set: function() { origVolDesc.set.call(this, 0); },
         get: function() { return 0; },
         configurable: true,
     });
+    
+    // Блокируем изменение muted — всегда true
     const origMutedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted');
     Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
         set: function() { origMutedDesc.set.call(this, true); },
         get: function() { return true; },
         configurable: true,
     });
+    
+    // Мутим все существующие и новые элементы
     const muteAll = function() {
         document.querySelectorAll('video, audio').forEach(function(el) {
             el.muted = true;
             el.volume = 0;
         });
     };
+    
+    // MutationObserver для автоматического мута новых элементов
     const obs = new MutationObserver(muteAll);
     obs.observe(document.documentElement, { childList: true, subtree: true });
+    
+    // Мутим сразу
     muteAll();
+    
+    // Периодическая проверка каждые 500ms (защита от багов)
+    setInterval(muteAll, 500);
 })();
 """
 

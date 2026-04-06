@@ -357,15 +357,36 @@ async def _do_like(page) -> None:
         'button[aria-label*="ike"]',
         'span[data-e2e="like-icon"]',
     ]
+    
+    # Импортируем JS функции для точечной разблокировки
+    from src.scroll_config import _JS_ALLOW_ELEMENT, _JS_DISALLOW_ALL
+    
     for sel in _LIKE_SELECTORS:
         try:
             el = page.locator(sel).first
             await el.wait_for(state="visible", timeout=2000)
+            
+            # КРИТИЧНО: разрешаем клик ТОЛЬКО на кнопку лайка
+            allowed = await page.evaluate(_JS_ALLOW_ELEMENT, sel)
+            if not allowed:
+                print(f"Не удалось разрешить элемент {sel}")
+                continue
+            
+            # Небольшая задержка чтобы разрешение применилось
+            await asyncio.sleep(0.1)
+            
+            # Кликаем
             await el.click()
             print("Лайк поставлен ✓")
+            
+            # КРИТИЧНО: сразу запрещаем все клики обратно
+            await asyncio.sleep(0.1)
+            await page.evaluate(_JS_DISALLOW_ALL)
+            
             return
         except Exception:
             continue
+    
     print("Кнопка лайка не найдена")
 
 
@@ -405,7 +426,33 @@ async def _do_follow(page, username: str) -> None:
             print(f"Уже подписан на @{username}")
             return
 
-        await follow_btn.click()
+        # КРИТИЧНО: клик мышью вместо .click() (имитация человека)
+        try:
+            box = await follow_btn.bounding_box()
+            if box:
+                print(f"Двигаю мышь к кнопке Follow...")
+                target_x = box["x"] + box["width"] / 2
+                target_y = box["y"] + box["height"] / 2
+                
+                # Движение мыши в несколько этапов
+                await page.mouse.move(target_x - 80, target_y - 40)
+                await asyncio.sleep(0.15)
+                await page.mouse.move(target_x - 40, target_y - 15)
+                await asyncio.sleep(0.1)
+                await page.mouse.move(target_x, target_y)
+                await asyncio.sleep(0.2)
+                
+                # Клик мышью
+                await page.mouse.click(target_x, target_y)
+                print(f"Кликнул мышью на Follow")
+            else:
+                # Fallback на обычный click
+                await follow_btn.click()
+                print(f"Кликнул через .click()")
+        except Exception as e:
+            print(f"Ошибка клика мышью: {e}, пробую .click()")
+            await follow_btn.click()
+        
         await asyncio.sleep(1.5)
         new_text = await follow_btn.inner_text()
         print(f"Подписался на @{username} ✓ (кнопка: {new_text!r})")

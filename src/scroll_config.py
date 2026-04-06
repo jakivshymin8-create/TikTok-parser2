@@ -97,7 +97,7 @@ SOFT_STOPWORDS = [
 STOPWORDS = HARD_STOPWORDS + SOFT_STOPWORDS
 
 # ── JS: блокировка скролла ленты (только после фиксации ролика в Python) ─────
-# Привязка к ролику: префикс src текущего playing — для отладки и согласованности
+# НОВАЯ СТРАТЕГИЯ: блокируем ВСЁ, разблокируем только конкретные элементы
 _JS_LOCK_FEED_SCROLL = """
     () => {
         const videos = Array.from(document.querySelectorAll('video'));
@@ -124,53 +124,137 @@ _JS_LOCK_FEED_SCROLL = """
         }
 
         window.__scrollBlocked = true;
+        window.__allowedElement = null; // Элемент который можно кликать
+        
+        // КРИТИЧНО: блокируем навигацию браузера
+        if (!window.__navigationBlocked) {
+            window.__navigationBlocked = true;
+            
+            window.__origHistoryBack = history.back;
+            window.__origHistoryForward = history.forward;
+            window.__origHistoryGo = history.go;
+            window.__origHistoryPushState = history.pushState;
+            window.__origHistoryReplaceState = history.replaceState;
+            
+            history.back = function() { console.log('[BLOCKED] history.back'); };
+            history.forward = function() { console.log('[BLOCKED] history.forward'); };
+            history.go = function() { console.log('[BLOCKED] history.go'); };
+            history.pushState = function() { console.log('[BLOCKED] history.pushState'); };
+            history.replaceState = function() { console.log('[BLOCKED] history.replaceState'); };
+            
+            window.__origBeforeUnload = window.onbeforeunload;
+            window.onbeforeunload = function(e) {
+                if (window.__scrollBlocked) {
+                    console.log('[BLOCKED] beforeunload');
+                    e.preventDefault();
+                    return false;
+                }
+            };
+        }
 
-        window.__blockKeyHandler = (e) => {
-            if (window.__scrollBlocked &&
-                (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-                e.stopImmediatePropagation();
-                e.preventDefault();
+        // ГЛОБАЛЬНАЯ блокировка всех событий (разрешаем только __allowedElement)
+        window.__globalBlockHandler = (e) => {
+            if (!window.__scrollBlocked) return;
+            
+            // Проверяем разрешён ли этот элемент
+            if (window.__allowedElement) {
+                let target = e.target;
+                // Проверяем сам элемент и его родителей
+                for (let i = 0; i < 5; i++) {
+                    if (!target) break;
+                    if (target === window.__allowedElement) {
+                        console.log('[ALLOWED] click on allowed element');
+                        return; // Разрешаем
+                    }
+                    target = target.parentElement;
+                }
             }
+            
+            // Блокируем всё остальное
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return false;
         };
-        document.addEventListener('keydown', window.__blockKeyHandler, true);
-
-        window.__blockWheelHandler = (e) => {
-            if (window.__scrollBlocked) {
-                e.stopImmediatePropagation();
-                e.preventDefault();
-            }
-        };
-        document.addEventListener('wheel', window.__blockWheelHandler,
-            { capture: true, passive: false });
-
-        window.__blockTouchHandler = (e) => {
-            if (window.__scrollBlocked) {
-                e.stopImmediatePropagation();
-                e.preventDefault();
-            }
-        };
-        document.addEventListener('touchmove', window.__blockTouchHandler,
-            { capture: true, passive: false });
+        
+        // Вешаем на ВСЕ события
+        document.addEventListener('click', window.__globalBlockHandler, true);
+        document.addEventListener('mousedown', window.__globalBlockHandler, true);
+        document.addEventListener('mouseup', window.__globalBlockHandler, true);
+        document.addEventListener('keydown', window.__globalBlockHandler, true);
+        document.addEventListener('keyup', window.__globalBlockHandler, true);
+        document.addEventListener('keypress', window.__globalBlockHandler, true);
+        document.addEventListener('wheel', window.__globalBlockHandler, { capture: true, passive: false });
+        document.addEventListener('scroll', window.__globalBlockHandler, { capture: true, passive: false });
+        document.addEventListener('touchstart', window.__globalBlockHandler, { capture: true, passive: false });
+        document.addEventListener('touchmove', window.__globalBlockHandler, { capture: true, passive: false });
+        document.addEventListener('touchend', window.__globalBlockHandler, { capture: true, passive: false });
     }
 """
 
 # ── JS: разблокировка скролла ─────────────────────────────────────────────────
-# Снимает все три блокировки (key + wheel + touch) — вызывать всегда при выходе из цикла с lock
 _JS_UNLOCK_SCROLL = """
     () => {
         window.__scrollBlocked = false;
         window.__feedScrollLockSrc = null;
-        if (window.__blockKeyHandler) {
-            document.removeEventListener('keydown', window.__blockKeyHandler, true);
-            window.__blockKeyHandler = null;
+        window.__allowedElement = null;
+        
+        // Восстанавливаем навигацию браузера
+        if (window.__navigationBlocked) {
+            window.__navigationBlocked = false;
+            
+            if (window.__origHistoryBack) history.back = window.__origHistoryBack;
+            if (window.__origHistoryForward) history.forward = window.__origHistoryForward;
+            if (window.__origHistoryGo) history.go = window.__origHistoryGo;
+            if (window.__origHistoryPushState) history.pushState = window.__origHistoryPushState;
+            if (window.__origHistoryReplaceState) history.replaceState = window.__origHistoryReplaceState;
+            
+            if (window.__origBeforeUnload !== undefined) {
+                window.onbeforeunload = window.__origBeforeUnload;
+            } else {
+                window.onbeforeunload = null;
+            }
         }
-        if (window.__blockWheelHandler) {
-            document.removeEventListener('wheel', window.__blockWheelHandler, { capture: true });
-            window.__blockWheelHandler = null;
+        
+        // Удаляем глобальный обработчик
+        if (window.__globalBlockHandler) {
+            document.removeEventListener('click', window.__globalBlockHandler, true);
+            document.removeEventListener('mousedown', window.__globalBlockHandler, true);
+            document.removeEventListener('mouseup', window.__globalBlockHandler, true);
+            document.removeEventListener('keydown', window.__globalBlockHandler, true);
+            document.removeEventListener('keyup', window.__globalBlockHandler, true);
+            document.removeEventListener('keypress', window.__globalBlockHandler, true);
+            document.removeEventListener('wheel', window.__globalBlockHandler, { capture: true });
+            document.removeEventListener('scroll', window.__globalBlockHandler, { capture: true });
+            document.removeEventListener('touchstart', window.__globalBlockHandler, { capture: true });
+            document.removeEventListener('touchmove', window.__globalBlockHandler, { capture: true });
+            document.removeEventListener('touchend', window.__globalBlockHandler, { capture: true });
+            window.__globalBlockHandler = null;
         }
-        if (window.__blockTouchHandler) {
-            document.removeEventListener('touchmove', window.__blockTouchHandler, { capture: true });
-            window.__blockTouchHandler = null;
+    }
+"""
+
+# ── JS: разрешить клик на конкретный элемент ──────────────────────────────────
+_JS_ALLOW_ELEMENT = """
+    (selector) => {
+        if (!selector) {
+            window.__allowedElement = null;
+            return false;
         }
+        const el = document.querySelector(selector);
+        if (el) {
+            window.__allowedElement = el;
+            console.log('[ALLOW] element:', selector);
+            return true;
+        }
+        console.log('[ALLOW] element not found:', selector);
+        return false;
+    }
+"""
+
+# ── JS: запретить все клики (сбросить разрешение) ─────────────────────────────
+_JS_DISALLOW_ALL = """
+    () => {
+        window.__allowedElement = null;
+        console.log('[DISALLOW] all elements blocked');
     }
 """

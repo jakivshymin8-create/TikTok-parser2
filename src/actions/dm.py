@@ -60,7 +60,16 @@ async def send_dm(page, username: str) -> bool:
     profile_url = page.url  # запоминаем для возврата
 
     try:
-        # 1. Кликаем кнопку Message на странице профиля
+        # КРИТИЧНО: имитация реального человека перед DM
+        # 1. Скроллим профиль (как будто смотрим)
+        _log("Имитация просмотра профиля...")
+        await page.evaluate("window.scrollTo(0, 200)")
+        await asyncio.sleep(0.8)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(0.6)
+        
+        # 2. Ищем кнопку Message
+        _log("Ищу кнопку Message...")
         msg_btn = None
         for sel in _MSG_BTN_SELECTORS:
             try:
@@ -76,21 +85,54 @@ async def send_dm(page, username: str) -> bool:
             _log("Кнопка Message не найдена → пропуск")
             return False
 
-        # 2. Кликаем и ждём навигации на /messages
-        # TikTok может открыть новую страницу чата или перейти на /messages
-        _log("Кликаю кнопку Message...")
-        await msg_btn.click()
+        # 3. Движение мыши к кнопке (имитация человека)
+        try:
+            box = await msg_btn.bounding_box()
+            if box:
+                _log("Двигаю мышь к кнопке Message...")
+                target_x = box["x"] + box["width"] / 2
+                target_y = box["y"] + box["height"] / 2
+                
+                # Движение мыши в несколько этапов
+                await page.mouse.move(target_x - 100, target_y - 50)
+                await asyncio.sleep(0.2)
+                await page.mouse.move(target_x - 50, target_y - 20)
+                await asyncio.sleep(0.15)
+                await page.mouse.move(target_x, target_y)
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            _log(f"Ошибка движения мыши: {e}")
+        
+        # 4. Кликаем кнопку Message МЫШЬЮ (не .click())
+        _log("Кликаю кнопку Message мышью...")
+        try:
+            # Клик мышью по координатам
+            await page.mouse.click(target_x, target_y)
+            _log("Кликнул мышью на Message")
+        except Exception as e:
+            _log(f"Ошибка клика мышью: {e}, пробую .click()")
+            await msg_btn.click()
 
-        # Ждём пока страница изменится (навигация на /messages или открытие чата)
-        await asyncio.sleep(3)
+        # 5. Ждём навигации (даём больше времени)
+        await asyncio.sleep(4)
         current_url = page.url
         _log(f"URL после клика: {current_url}")
+        
+        # 6. Имитация загрузки страницы чата
+        _log("Имитация загрузки чата...")
+        try:
+            await page.evaluate("window.scrollTo(0, 100)")
+            await asyncio.sleep(0.5)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
 
         # 3. Ищем поле ввода — ждём дольше, TikTok рендерит его лениво
         input_el = None
-        _log("Ищу поле ввода (ждём до 10с)...")
+        _log("Ищу поле ввода (ждём до 20с)...")
 
-        for attempt in range(5):  # 5 попыток по 2 секунды = 10 секунд максимум
+        for attempt in range(10):  # 10 попыток по 2 секунды = 20 секунд максимум
             for sel in _INPUT_SELECTORS:
                 try:
                     el = page.locator(sel).first
@@ -108,11 +150,11 @@ async def send_dm(page, username: str) -> bool:
             if input_el is not None:
                 break
 
-            _log(f"Поле не найдено, жду ещё 2с... (попытка {attempt + 1}/5)")
+            _log(f"Поле не найдено, жду ещё 2с... (попытка {attempt + 1}/10)")
             await asyncio.sleep(2)
 
         if input_el is None:
-            _log("Поле ввода не найдено за 10с → пропуск")
+            _log("Поле ввода не найдено за 20с → пропуск")
             await _safe_return(page, profile_url)
             return False
 
@@ -157,7 +199,7 @@ async def send_dm(page, username: str) -> bool:
                 if is_enabled:
                     await btn.click()
                     await asyncio.sleep(1.5)
-                    _log(f"DM отправлен через кнопку ({sel}) @{username} ✓")
+                    _log(f"Кнопка Send нажата ({sel})")
                     sent = True
                     break
             except Exception:
@@ -167,10 +209,43 @@ async def send_dm(page, username: str) -> bool:
             _log("Кнопка Send не найдена → Enter")
             await page.keyboard.press("Enter")
             await asyncio.sleep(1.5)
-            _log(f"DM отправлен через Enter @{username} ✓")
             sent = True
 
-        # 7. Возврат на страницу профиля
+        # 7. Проверка что сообщение реально отправлено
+        if sent:
+            await asyncio.sleep(1.0)
+            try:
+                # Проверяем что поле ввода очистилось (признак отправки)
+                field_after = await input_el.inner_text()
+                if not field_after.strip():
+                    _log(f"✓ DM отправлен успешно @{username} (поле очищено)")
+                else:
+                    # Поле не очистилось — проверяем наличие сообщения в чате
+                    try:
+                        # Ищем наше сообщение в истории чата
+                        message_found = await page.evaluate(
+                            """(text) => {
+                                const messages = Array.from(document.querySelectorAll('[class*="message" i], [class*="Message" i]'));
+                                for (const msg of messages) {
+                                    if (msg.innerText && msg.innerText.includes(text.substring(0, 30))) {
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }""",
+                            DM_TEXT
+                        )
+                        if message_found:
+                            _log(f"✓ DM отправлен успешно @{username} (найдено в чате)")
+                        else:
+                            _log(f"⚠️  Не удалось подтвердить отправку DM @{username}")
+                            sent = False
+                    except Exception:
+                        _log(f"⚠️  Не удалось проверить отправку DM @{username}")
+            except Exception as e:
+                _log(f"Ошибка проверки отправки: {e}")
+
+        # 8. Возврат на страницу профиля
         await _safe_return(page, profile_url)
         return sent
 

@@ -570,14 +570,28 @@ async def _keyboard_scroll_and_wait_change(
         _log(f"раунд fallback {round_i + 1}/{_MAX_FALLBACK_ROUNDS}")
         for step_name, fn in steps:
             await _focus_video_for_scroll(page)
+            
+            # КРИТИЧНО: задержка перед действием (контроль скорости)
+            await asyncio.sleep(0.3)
+            
             await fn(page)
+            
+            # КРИТИЧНО: задержка после действия (даём UI время обработать)
+            await asyncio.sleep(0.5)
+            
             if await _wait_until_snapshot_differs(
                 page, before, timeout_ms=_CHANGE_WAIT_SHORT_MS
             ):
                 _log(f"ролик сменился после «{step_name}» ✓")
                 await _ensure_muted(page)
+                
+                # КРИТИЧНО: задержка после смены видео (стабилизация)
+                await asyncio.sleep(0.8)
                 return
             _log(f"нет смены video_src после «{step_name}»")
+            
+            # КРИТИЧНО: задержка между попытками
+            await asyncio.sleep(0.4)
 
     _log("все шаги исчерпаны — залипание → reload + For You")
     await _reload_and_return_to_feed(page)
@@ -594,6 +608,11 @@ async def _scroll_feed_next(
             f"SCROLL запрещён: processing_video=True (reason={reason})"
         )
     await _ensure_feed_scroll_unlocked(page)
+    
+    # КРИТИЧНО: задержка перед скроллом (контроль скорости)
+    _log(f"Задержка 0.5с перед скроллом (reason={reason})")
+    await asyncio.sleep(0.5)
+    
     await _keyboard_scroll_and_wait_change(page, before, reason)
 
 
@@ -603,14 +622,26 @@ async def _end_processing_and_scroll_feed(
     """Завершить цикл одного видео и перейти к следующему ролику."""
     _end_feed_video_safe()
     await _ensure_feed_scroll_unlocked(page)
+    
+    # КРИТИЧНО: задержка перед скроллом (контроль скорости)
+    _log(f"Задержка 0.5с перед скроллом (reason={reason})")
+    await asyncio.sleep(0.5)
+    
     await _keyboard_scroll_and_wait_change(page, before, reason)
 
 
-async def _analyze_with_stale_guard(page: Page, snap: VideoContext) -> None:
+async def _analyze_with_stale_guard(page: Page, snap: VideoContext) -> bool:
     """
     analyze только с forced_* из snap.
     Смена ролика: сравнение identity (video_src / username), без чтения caption.
+    Возвращает True если анализ завершился успешно, False если видео сменилось.
+    
+    КРИТИЧНО: во время analyze блокировка скролла должна быть активна!
+    НО проверки делаем ТОЛЬКО когда мы в ленте, не в профиле!
     """
+    # Запоминаем исходный video_src для строгой проверки
+    original_src = snap.video_src
+    
     t = asyncio.create_task(
         analyze_one_video(
             page,
@@ -619,33 +650,63 @@ async def _analyze_with_stale_guard(page: Page, snap: VideoContext) -> None:
             forced_caption=snap.caption,
         )
     )
+    
+    check_count = 0
     while not t.done():
         await asyncio.sleep(_STALE_POLL_S)
+        check_count += 1
+        
+        # КРИТИЧНО: проверяем только если мы в ленте, не в профиле
+        current_url = page.url
+        if "tiktok.com/@" in current_url:
+            # Мы в профиле — не проверяем video_src (его там нет)
+            if check_count % 10 == 0:  # Логируем каждые 5.5 секунд
+                _log(f"analyze в профиле (проверка #{check_count}): {current_url[:60]}")
+            continue
+        
+        # Мы в ленте — проверяем video_src
         u, src = await _read_identity_only(page)
+        
+        # СТРОГАЯ проверка: video_src должен быть ТОЧНО таким же
+        if original_src and src and src != original_src:
+            _log(f"video_src изменился во время analyze (проверка #{check_count}): {original_src[:40]} → {src[:40]}")
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            await _ensure_feed_scroll_unlocked(page)
+            return False
+            
         if snap.video_src and src and src != snap.video_src:
-            _log("video_src изменился во время analyze → отмена + unlock")
+            _log(f"video_src изменился во время analyze → отмена + unlock (проверка #{check_count})")
             t.cancel()
             try:
                 await t
             except asyncio.CancelledError:
                 pass
             await _ensure_feed_scroll_unlocked(page)
-            return
+            return False
+            
         if snap.username and u and u != snap.username:
-            _log("username (identity) изменился во время analyze → отмена + unlock")
+            _log(f"username (identity) изменился во время analyze → отмена + unlock (проверка #{check_count})")
             t.cancel()
             try:
                 await t
             except asyncio.CancelledError:
                 pass
             await _ensure_feed_scroll_unlocked(page)
-            return
+            return False
+    
     try:
         await t
+        _log(f"analyze завершён успешно (выполнено {check_count} проверок)")
+        return True
     except asyncio.CancelledError:
-        pass
+        return False
     except Exception as e:
         print(f"Ошибка analyze_one_video: {e}")
+        return False
 
 
 async def human_scroll(page: Page) -> None:
@@ -665,6 +726,10 @@ async def human_scroll(page: Page) -> None:
         assert not _feed_processing, "цикл: processing должен быть False"
 
         await _ensure_feed_scroll_unlocked(page)
+        
+        # КРИТИЧНО: задержка в начале цикла (контроль скорости)
+        print("Задержка 0.5с перед обработкой нового видео...")
+        await asyncio.sleep(0.5)
 
         await ensure_video_playing(page)
         await _wait_dom_ready(page)
@@ -712,6 +777,10 @@ async def human_scroll(page: Page) -> None:
             continue
 
         _begin_feed_video(snap)
+        
+        # КРИТИЧНО: запоминаем video_src для защиты от повторной обработки
+        current_video_src = snap.video_src
+        
         try:
             print(f"USERNAME (зафиксировано): {snap.username}")
             cap_preview = snap.caption[:120] + "…" if len(snap.caption) > 120 else snap.caption
@@ -789,9 +858,12 @@ async def human_scroll(page: Page) -> None:
 
             print("Наша тематика ✓ → лайк + блокировка + досматриваю видео")
 
-            await _do_like(page)
+            # Флаг для отслеживания успешности цикла
+            should_continue_to_next = False
+            analyze_completed = False
 
             try:
+                # КРИТИЧНО: блокировка ПЕРЕД лайком (чтобы видео не переключилось)
                 try:
                     await _lock_feed_scroll(page)
                     print(
@@ -801,100 +873,188 @@ async def human_scroll(page: Page) -> None:
                 except Exception as e:
                     print(f"Ошибка блокировки: {e} → продолжаем без lock")
 
-                duration = await _get_video_duration(page)
-                watch_time = max(3.0, min(duration - 2.0, 30.0))
-                print(f"Длина видео: {duration:.1f}с → смотрю {watch_time:.1f}с")
-                await _watch_video(page, watch_time)
+                # КРИТИЧНО: задержка после блокировки (даём JS время применить обработчики)
+                await asyncio.sleep(0.3)
+                
+                # Сразу после задержки ставим лайк
+                await _do_like(page)
+                
+                # Задержка ПОСЛЕ лайка
+                await asyncio.sleep(0.8)
 
-                try:
-                    await page.evaluate(
-                        """
-                        () => {
-                            const videos = Array.from(document.querySelectorAll('video'));
-                            let playing = null;
-                            for (const v of videos) {
-                                if (!v.paused && !v.ended && v.src && v.src.length > 8) {
-                                    playing = v;
-                                    break;
-                                }
-                            }
-                            if (!playing) {
-                                for (const v of videos) {
-                                    if (v.src && v.src.length > 8) { playing = v; break; }
-                                }
-                            }
-                            if (!playing && videos.length) playing = videos[0];
-                            if (playing) { playing.loop = false; playing.pause(); }
-                        }
-                        """
-                    )
-                except Exception:
-                    pass
-
-                u1, src1 = await _read_identity_only(page)
-                if not _identity_matches_snap(u1, src1, snap):
-                    print("ролик сдвинулся до analyze → скип analyze")
+                # Проверка что видео не сменилось после лайка
+                await asyncio.sleep(0.5)
+                u_after_like, src_after_like = await _read_identity_only(page)
+                if not _identity_matches_snap(u_after_like, src_after_like, snap):
+                    print("Видео сменилось после лайка → скип")
                     last_completed_src = snap.video_src or None
-                    await _end_processing_and_scroll_feed(page, snap, "pre_analyze_drift")
-                    continue
+                    await _end_processing_and_scroll_feed(page, snap, "post_like_drift")
+                    should_continue_to_next = True
+                
+                # ДОПОЛНИТЕЛЬНАЯ проверка: video_src должен совпадать с зафиксированным
+                if not should_continue_to_next and src_after_like != current_video_src:
+                    print(f"⚠️  video_src изменился: {current_video_src[:40]} → {src_after_like[:40]}")
+                    last_completed_src = snap.video_src or None
+                    await _end_processing_and_scroll_feed(page, snap, "src_changed_after_like")
+                    should_continue_to_next = True
+                
+                if not should_continue_to_next:
+                    duration = await _get_video_duration(page)
+                    watch_time = max(3.0, min(duration - 2.0, 30.0))
+                    print(f"Длина видео: {duration:.1f}с → смотрю {watch_time:.1f}с")
+                    
+                    # Досматриваем видео с периодическими проверками
+                    watch_start = asyncio.get_event_loop().time()
+                    video_drifted = False
+                    while (asyncio.get_event_loop().time() - watch_start) < watch_time:
+                        await asyncio.sleep(min(2.0, watch_time - (asyncio.get_event_loop().time() - watch_start)))
+                        
+                        # Проверяем что видео не сменилось во время просмотра
+                        u_watch, src_watch = await _read_identity_only(page)
+                        
+                        # СТРОГАЯ проверка: video_src должен быть ТОЧНО таким же
+                        if src_watch != current_video_src:
+                            print(f"⚠️  video_src изменился во время просмотра: {current_video_src[:40]} → {src_watch[:40]}")
+                            last_completed_src = snap.video_src or None
+                            await _end_processing_and_scroll_feed(page, snap, "during_watch_drift")
+                            should_continue_to_next = True
+                            video_drifted = True
+                            break
+                        
+                        if not _identity_matches_snap(u_watch, src_watch, snap):
+                            print("Видео сменилось во время просмотра → скип analyze")
+                            last_completed_src = snap.video_src or None
+                            await _end_processing_and_scroll_feed(page, snap, "during_watch_drift")
+                            should_continue_to_next = True
+                            video_drifted = True
+                            break
+                    
+                    if not video_drifted and not should_continue_to_next:
+                        # Просмотр завершён успешно
+                        try:
+                            await page.evaluate(
+                                """
+                                () => {
+                                    const videos = Array.from(document.querySelectorAll('video'));
+                                    let playing = null;
+                                    for (const v of videos) {
+                                        if (!v.paused && !v.ended && v.src && v.src.length > 8) {
+                                            playing = v;
+                                            break;
+                                        }
+                                    }
+                                    if (!playing) {
+                                        for (const v of videos) {
+                                            if (v.src && v.src.length > 8) { playing = v; break; }
+                                        }
+                                    }
+                                    if (!playing && videos.length) playing = videos[0];
+                                    if (playing) { playing.loop = false; playing.pause(); }
+                                }
+                                """
+                            )
+                        except Exception:
+                            pass
 
-                await _analyze_with_stale_guard(page, snap)
+                        # ФИНАЛЬНАЯ проверка перед analyze
+                        await asyncio.sleep(0.5)
+                        u1, src1 = await _read_identity_only(page)
+                        
+                        # СТРОГАЯ проверка: video_src должен быть ТОЧНО таким же
+                        if src1 != current_video_src:
+                            print(f"⚠️  video_src изменился перед analyze: {current_video_src[:40]} → {src1[:40]}")
+                            last_completed_src = snap.video_src or None
+                            await _end_processing_and_scroll_feed(page, snap, "pre_analyze_src_drift")
+                            should_continue_to_next = True
+                        elif not _identity_matches_snap(u1, src1, snap):
+                            print("ролик сдвинулся после просмотра → скип analyze")
+                            last_completed_src = snap.video_src or None
+                            await _end_processing_and_scroll_feed(page, snap, "pre_analyze_drift")
+                            should_continue_to_next = True
+                        else:
+                            # Запускаем analyze только если видео не менялось
+                            analyze_success = await _analyze_with_stale_guard(page, snap)
+                            if not analyze_success:
+                                print("analyze прерван из-за смены видео")
+                                last_completed_src = snap.video_src or None
+                                await _end_processing_and_scroll_feed(page, snap, "analyze_interrupted")
+                                should_continue_to_next = True
+                            else:
+                                analyze_completed = True
 
             finally:
                 await _ensure_feed_scroll_unlocked(page)
                 print("JS блокировка скролла снята (finally)")
-
-            current = page.url
-            if "tiktok.com/@" in current or (current and "tiktok.com" not in current):
-                print("Страница на профиле → возврат в ленту")
-                try:
-                    await page.goto(FEED_URL, wait_until="domcontentloaded", timeout=15_000)
-                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                    await _ensure_muted(page)
-                    await ensure_video_playing(page)
-                    await _wait_dom_ready(page)
-                except Exception as e:
-                    print(f"Ошибка возврата: {e}")
-
-                leave = await _take_snapshot(page)
-                for _skip in range(3):
-                    if (
-                        leave
-                        and leave.username
-                        and leave.username != snap.username
-                    ):
-                        print(f"Продвинулись вперёд: @{leave.username}")
-                        break
-                    print(f"Всё ещё @{snap.username} → ArrowDown #{_skip + 1}")
-                    prev_leave = leave or snap
-                    await _end_processing_and_scroll_feed(page, prev_leave, "leave_profile")
-                    leave = await _take_snapshot(page)
-
-                last_dedup_key = None
-                if leave:
-                    last_completed_src = leave.video_src or None
-                print("после профиля — новая итерация")
+            
+            # Если нужно перейти к следующему видео — делаем continue
+            if should_continue_to_next:
                 continue
 
-            u_post, src_post = await _read_identity_only(page)
-            if not _identity_matches_snap(u_post, src_post, snap):
-                print("post-analyze: identity не совпадает со snap → цикл с текущим DOM")
-                last_completed_src = src_post or snap.video_src or None
+            # Если analyze завершился успешно
+            if analyze_completed:
+                # analyze_one_video уже обработал профиль, DM, похожих и вернулся
+                # Проверяем где мы сейчас
+                current = page.url
+                
+                # Если мы на профиле или вне TikTok — возвращаемся в ленту
+                if "tiktok.com/@" in current or (current and "tiktok.com" not in current):
+                    print("После analyze на профиле → возврат в ленту")
+                    try:
+                        await page.goto(FEED_URL, wait_until="domcontentloaded", timeout=15_000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                        await _ensure_muted(page)
+                        await ensure_video_playing(page)
+                        await _wait_dom_ready(page)
+                    except Exception as e:
+                        print(f"Ошибка возврата: {e}")
+
+                    # Проверяем что мы на новом видео
+                    leave = await _take_snapshot(page)
+                    for _skip in range(3):
+                        if (
+                            leave
+                            and leave.username
+                            and leave.username != snap.username
+                        ):
+                            print(f"Продвинулись вперёд: @{leave.username}")
+                            break
+                        print(f"Всё ещё @{snap.username} → ArrowDown #{_skip + 1}")
+                        prev_leave = leave or snap
+                        await _end_processing_and_scroll_feed(page, prev_leave, "leave_profile")
+                        leave = await _take_snapshot(page)
+
+                    last_dedup_key = None
+                    if leave:
+                        last_completed_src = leave.video_src or None
+                    print("после профиля — новая итерация")
+                    continue
+                
+                # Если мы в ленте — проверяем что видео то же самое
+                u_post, src_post = await _read_identity_only(page)
+                if not _identity_matches_snap(u_post, src_post, snap):
+                    print("post-analyze: identity не совпадает со snap → цикл с текущим DOM")
+                    last_completed_src = src_post or snap.video_src or None
+                    print("Следующее видео ↓")
+                    await _end_processing_and_scroll_feed(
+                        page,
+                        await _baseline_for_scroll(page, snap),
+                        "post_analyze_drift",
+                    )
+                    continue
+
+                # Всё ок — переходим к следующему видео
+                last_completed_src = snap.video_src or None
                 print("Следующее видео ↓")
                 await _end_processing_and_scroll_feed(
                     page,
                     await _baseline_for_scroll(page, snap),
-                    "post_analyze_drift",
+                    "main_advance",
                 )
-                continue
-
-            last_completed_src = snap.video_src or None
-            print("Следующее видео ↓")
-            await _end_processing_and_scroll_feed(
-                page,
-                await _baseline_for_scroll(page, snap),
-                "main_advance",
-            )
+            else:
+                # analyze не запускался или был прерван — уже обработано выше
+                print("⚠️  Неожиданное состояние: analyze не завершён и не прерван")
+                last_completed_src = snap.video_src or None
+                await _end_processing_and_scroll_feed(page, snap, "unexpected_state")
 
         finally:
             _end_feed_video_safe()
